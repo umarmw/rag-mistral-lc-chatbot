@@ -2,7 +2,7 @@ import logging
 import time
 from typing import Iterator, Optional
 from llama_cpp import Llama
-from pydantic import BaseSettings
+from pydantic_settings import BaseSettings
 from functools import lru_cache
 
 # Configure logging
@@ -72,18 +72,42 @@ def trim_conversation_history(history: list, max_history_tokens: int = 1000) -> 
     
     return trimmed_history
 
-def build_rag_prompt(context: str, history: list, question: str) -> str:
-    """Build a well-structured RAG prompt."""
+def build_rag_prompt(context: str, history: list, question: str, documents_metadata: list = None) -> str:
+    """Build a well-structured RAG prompt with enhanced context information."""
     # Trim history to prevent context overflow
     max_context_tokens = estimate_tokens(context)
-    remaining_tokens = settings.max_dialog_tokens - max_context_tokens - 200  # Buffer for question and formatting
+    remaining_tokens = settings.max_dialog_tokens - max_context_tokens - 300  # Increased buffer
     
     trimmed_history = trim_conversation_history(history, max(remaining_tokens, 500))
     
-    prompt = f"""You are a helpful assistant. Use the provided context to answer questions accurately. If the context doesn't contain relevant information, say so clearly.
+    # Build context section with metadata if available
+    context_section = "[CONTEXT]\n"
+    if documents_metadata and len(documents_metadata) > 0:
+        context_section += f"Found {len(documents_metadata)} relevant documents:\n\n"
+        for i, doc_meta in enumerate(documents_metadata, 1):
+            similarity = doc_meta.get('similarity_score', 'N/A')
+            if isinstance(similarity, float):
+                similarity = f"{similarity:.2f}"
+            context_section += f"Document {i} (Relevance: {similarity}):\n{doc_meta.get('content', '')}\n\n"
+    else:
+        context_section += f"{context}\n\n"
+    
+    # Determine context quality
+    context_quality = "high" if documents_metadata and any(
+        doc.get('similarity_score', 0) > 0.8 for doc in documents_metadata
+    ) else "moderate"
+    
+    prompt = f"""You are a knowledgeable assistant. Use the provided context to answer questions accurately and comprehensively.
 
-[CONTEXT]
-{context}
+{context_section}
+
+INSTRUCTIONS:
+- Base your answer primarily on the context provided above
+- If the context has high relevance, provide a detailed answer
+- If the context has moderate relevance, acknowledge any limitations
+- If the context doesn't contain relevant information, state this clearly
+- Cite specific information from the documents when possible
+- Current context quality: {context_quality}
 
 [CONVERSATION HISTORY]
 """
@@ -95,11 +119,11 @@ def build_rag_prompt(context: str, history: list, question: str) -> str:
         if content:
             prompt += f"{role}: {content}\n"
     
-    prompt += f"Human: {question}\nAssistant: Based on the context provided, "
+    prompt += f"Human: {question}\nAssistant: "
     
     # Log prompt length for monitoring
     prompt_tokens = estimate_tokens(prompt)
-    logger.info(f"Generated prompt with ~{prompt_tokens} tokens")
+    logger.info(f"Generated prompt with ~{prompt_tokens} tokens, context quality: {context_quality}")
     
     if prompt_tokens > settings.n_ctx - settings.max_tokens:
         logger.warning(f"Prompt may exceed context window ({prompt_tokens} + {settings.max_tokens} > {settings.n_ctx})")

@@ -66,7 +66,9 @@ def check_server_health() -> Dict[str, Any]:
     except requests.RequestException as e:
         return {"status": "unhealthy", "error": str(e)}
 
-def send_question(question: str, history: list, use_streaming: bool = False) -> Dict[str, Any]:
+def send_question(question: str, history: list, use_streaming: bool = False, 
+                 max_tokens: int = 512, k: int = 3, similarity_threshold: float = 0.7,
+                 use_context_limit: bool = True) -> Dict[str, Any]:
     """Send question to the API and get response."""
     try:
         if use_streaming:
@@ -78,7 +80,11 @@ def send_question(question: str, history: list, use_streaming: bool = False) -> 
         
         payload = {
             "question": question,
-            "history": history
+            "history": history,
+            "max_tokens": max_tokens,
+            "k": k,
+            "similarity_threshold": similarity_threshold,
+            "use_context_limit": use_context_limit
         }
         
         response = requests.post(endpoint, json=payload, timeout=30)
@@ -145,8 +151,21 @@ def main():
             return
         
         # Display model info if available
-        if "model" in health_status:
-            model_info = health_status["model"]
+        if "components" in health_status and "vectorstore" in health_status["components"]:
+            vectorstore_info = health_status["components"]["vectorstore"]
+            if vectorstore_info.get("index_loaded"):
+                st.success("✅ Vector Index Loaded")
+                with st.expander("Vectorstore Details"):
+                    st.write(f"**Total Documents:** {vectorstore_info.get('total_documents', 'N/A')}")
+                    st.write(f"**Embedding Model:** {vectorstore_info.get('embedding_model', 'N/A')}")
+                    st.write(f"**Embedding Dimension:** {vectorstore_info.get('embedding_dimension', 'N/A')}")
+                    st.write(f"**Default K:** {vectorstore_info.get('retrieval_k', 'N/A')}")
+                    st.write(f"**Similarity Threshold:** {vectorstore_info.get('similarity_threshold', 'N/A')}")
+            else:
+                st.error("❌ Vector Index Not Loaded")
+        
+        if "components" in health_status and "llm" in health_status["components"]:
+            model_info = health_status["components"]["llm"]
             if model_info.get("model_loaded"):
                 st.success("✅ Model Loaded")
                 with st.expander("Model Details"):
@@ -176,12 +195,38 @@ def main():
             st.success("Chat history cleared!")
             st.rerun()
         
-        if st.button("🔄 Clear Server Cache"):
-            with st.spinner("Clearing server cache..."):
-                if clear_cache():
-                    st.success("Server cache cleared!")
+        if st.button("🔍 Test Document Search"):
+            test_query = st.text_input("Search query:", placeholder="Enter a search term...")
+            if test_query:
+                with st.spinner("Searching documents..."):
+                    try:
+                        response = requests.post(f"{API_BASE_URL}/search", 
+                                               params={"query": test_query, "k": 3, "with_scores": True})
+                        if response.status_code == 200:
+                            search_results = response.json()
+                            st.success(f"Found {search_results['count']} documents")
+                            
+                            for i, result in enumerate(search_results['results'], 1):
+                                with st.expander(f"Document {i} (Score: {result.get('similarity_score', 'N/A'):.3f})"):
+                                    st.write(result['content'][:500] + "..." if len(result['content']) > 500 else result['content'])
+                                    if result.get('metadata'):
+                                        st.json(result['metadata'])
+                        else:
+                            st.error("Search failed")
+                    except Exception as e:
+                        st.error(f"Search error: {str(e)}")
+        
+        st.header("📊 System Info")
+        if st.button("🔄 Refresh System Info"):
+            try:
+                response = requests.get(f"{API_BASE_URL}/vectorstore/info")
+                if response.status_code == 200:
+                    info = response.json()
+                    st.json(info)
                 else:
-                    st.error("Failed to clear server cache")
+                    st.error("Failed to get system info")
+            except Exception as e:
+                st.error(f"Error: {str(e)}")
         
         # Advanced options
         st.session_state.show_advanced = st.checkbox("Show Advanced Options", st.session_state.show_advanced)
@@ -189,12 +234,20 @@ def main():
         if st.session_state.show_advanced:
             st.header("⚙️ Advanced Options")
             max_tokens = st.slider("Max Response Tokens", 50, 1000, 512)
+            retrieval_k = st.slider("Documents to Retrieve (k)", 1, 10, 3)
+            similarity_threshold = st.slider("Similarity Threshold", 0.0, 1.0, 0.7, 0.05)
+            use_context_limit = st.checkbox("Use Context Length Limiting", True)
             show_processing_time = st.checkbox("Show Processing Time", True)
-            show_context_info = st.checkbox("Show Context Info", False)
+            show_context_info = st.checkbox("Show Context Info", True)
+            show_similarity_scores = st.checkbox("Show Similarity Scores", False)
         else:
             max_tokens = 512
+            retrieval_k = 3
+            similarity_threshold = 0.7
+            use_context_limit = True
             show_processing_time = True
             show_context_info = False
+            show_similarity_scores = False
     
     # Main chat interface
     col1, col2 = st.columns([3, 1])
@@ -252,7 +305,14 @@ def main():
                     api_history = st.session_state.chat_turns[-20:] if len(st.session_state.chat_turns) > 20 else st.session_state.chat_turns
                     
                     # Send request
-                    result = send_question(question, api_history)
+                    result = send_question(
+                        question, 
+                        api_history,
+                        max_tokens=max_tokens,
+                        k=retrieval_k,
+                        similarity_threshold=similarity_threshold,
+                        use_context_limit=use_context_limit
+                    )
                     
                     if result["success"]:
                         response_data = result["data"]
@@ -262,7 +322,7 @@ def main():
                         st.markdown(answer)
                         
                         # Show additional info
-                        info_cols = st.columns(3)
+                        info_cols = st.columns(4)
                         
                         if show_processing_time and "processing_time" in response_data:
                             with info_cols[0]:
@@ -272,6 +332,20 @@ def main():
                             with info_cols[1]:
                                 context_status = "✅ KB used" if response_data["context_used"] else "⚠️ No context"
                                 st.caption(context_status)
+                        
+                        if "documents_count" in response_data:
+                            with info_cols[2]:
+                                st.caption(f"📄 {response_data['documents_count']} docs")
+                        
+                        if show_similarity_scores and "avg_similarity" in response_data:
+                            with info_cols[3]:
+                                st.caption(f"🎯 {response_data['avg_similarity']:.2f} sim")
+                        
+                        # Show context quality if available
+                        if show_context_info and "context_quality" in response_data:
+                            quality = response_data["context_quality"]
+                            quality_color = {"high": "🟢", "moderate": "🟡", "low": "🔴"}.get(quality, "⚪")
+                            st.caption(f"{quality_color} Context quality: **{quality}**")
                         
                         if "tokens_estimated" in response_data:
                             with info_cols[2]:

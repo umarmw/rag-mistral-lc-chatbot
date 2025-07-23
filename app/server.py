@@ -8,7 +8,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, validator
 
-from app.rag_chain import get_retriever
+from app.rag_chain import (
+    get_retriever, 
+    search_documents, 
+    get_vectorstore_info, 
+    health_check as rag_health_check
+)
 from models.local_llm import (
     initialize_model, 
     generate_response, 
@@ -71,6 +76,9 @@ class Query(BaseModel):
     question: str
     history: List[ConversationTurn] = []
     max_tokens: int = None
+    k: int = 3  # Number of documents to retrieve
+    similarity_threshold: float = 0.7  # Similarity threshold for filtering
+    use_context_limit: bool = True  # Whether to use context length limiting
     
     @validator('question')
     def validate_question(cls, v):
@@ -92,12 +100,27 @@ class Query(BaseModel):
         if v is not None and (v < 1 or v > 2048):
             raise ValueError('max_tokens must be between 1 and 2048')
         return v
+    
+    @validator('k')
+    def validate_k(cls, v):
+        if v < 1 or v > 10:
+            raise ValueError('k must be between 1 and 10')
+        return v
+    
+    @validator('similarity_threshold')
+    def validate_similarity_threshold(cls, v):
+        if v < 0.0 or v > 1.0:
+            raise ValueError('similarity_threshold must be between 0.0 and 1.0')
+        return v
 
 class ChatResponse(BaseModel):
     answer: str
     processing_time: float
     context_used: bool = True
     tokens_estimated: int = 0
+    documents_count: int = 0
+    avg_similarity: float = 0.0
+    context_quality: str = "unknown"
 
 class ErrorResponse(BaseModel):
     error: str
@@ -135,14 +158,47 @@ class RAGService:
             logger.error(f"Error retrieving context: {str(e)}")
             return "Error retrieving context from knowledge base."
     
-    def generate_answer(self, question: str, history: List[Dict], max_tokens: int = None) -> Dict[str, Any]:
-        """Generate answer using RAG pipeline."""
+    def generate_answer(self, question: str, history: List[Dict], max_tokens: int = None, 
+                       k: int = 3, similarity_threshold: float = 0.7, 
+                       use_context_limit: bool = True) -> Dict[str, Any]:
+        """Generate answer using enhanced RAG pipeline."""
         start_time = time.time()
         
         try:
-            # Get context
-            context = self.get_cached_context(question)
-            context_used = "Error retrieving context" not in context and "No relevant context" not in context
+            # Get enhanced retriever with custom parameters
+            retriever = get_retriever(k=k, similarity_threshold=similarity_threshold)
+            
+            # Get documents with enhanced features
+            if use_context_limit:
+                docs = retriever.get_relevant_documents_with_context_limit(question)
+            else:
+                docs = retriever.get_relevant_documents(question, k=k)
+            
+            context_used = len(docs) > 0
+            
+            # Extract context and metadata
+            documents_metadata = []
+            context_parts = []
+            
+            for doc in docs:
+                doc_info = {
+                    'content': doc.page_content,
+                    'similarity_score': doc.metadata.get('similarity_score', 0.0),
+                    'source': doc.metadata.get('source', 'unknown'),
+                    'trimmed': doc.metadata.get('trimmed', False)
+                }
+                documents_metadata.append(doc_info)
+                context_parts.append(doc.page_content)
+            
+            context = "\n\n".join(context_parts) if context_parts else "No relevant context found."
+            
+            # Calculate context quality metrics
+            avg_similarity = 0.0
+            if documents_metadata:
+                similarities = [doc.get('similarity_score', 0.0) for doc in documents_metadata]
+                avg_similarity = sum(similarities) / len(similarities)
+            
+            context_quality = "high" if avg_similarity > 0.8 else "moderate" if avg_similarity > 0.6 else "low"
             
             # Convert ConversationTurn objects to dicts for prompt building
             history_dicts = []
@@ -152,8 +208,8 @@ class RAGService:
                 else:
                     history_dicts.append(turn)
             
-            # Build prompt
-            prompt = build_rag_prompt(context, history_dicts, question)
+            # Build enhanced prompt with metadata
+            prompt = build_rag_prompt(context, history_dicts, question, documents_metadata)
             
             # Generate response
             answer = generate_response(prompt, max_tokens)
@@ -164,11 +220,14 @@ class RAGService:
                 "answer": answer,
                 "processing_time": processing_time,
                 "context_used": context_used,
-                "tokens_estimated": len(answer.split()) * 1.3
+                "tokens_estimated": len(answer.split()) * 1.3,
+                "documents_count": len(docs),
+                "avg_similarity": round(avg_similarity, 3),
+                "context_quality": context_quality
             }
             
         except Exception as e:
-            logger.error(f"Error in RAG pipeline: {str(e)}")
+            logger.error(f"Error in enhanced RAG pipeline: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to generate response: {str(e)}")
 
 # Global RAG service
@@ -221,16 +280,25 @@ async def root():
 
 @app.get("/health")
 async def health():
-    """Health check endpoint."""
+    """Enhanced health check endpoint."""
     try:
         model_health = health_check()
-        retriever_health = retriever is not None
+        rag_health = rag_health_check()
+        vectorstore_info = get_vectorstore_info()
+        
+        overall_status = "healthy" if (
+            model_health["model_loaded"] and 
+            rag_health["status"] == "healthy"
+        ) else "unhealthy"
         
         return {
-            "status": "healthy" if model_health["model_loaded"] and retriever_health else "unhealthy",
-            "model": model_health,
-            "retriever_initialized": retriever_health,
-            "timestamp": time.time()
+            "status": overall_status,
+            "timestamp": time.time(),
+            "components": {
+                "llm": model_health,
+                "rag": rag_health,
+                "vectorstore": vectorstore_info
+            }
         }
     except Exception as e:
         logger.error(f"Health check failed: {str(e)}")
@@ -238,17 +306,20 @@ async def health():
 
 @app.post("/ask", response_model=ChatResponse)
 async def ask_question(query: Query):
-    """Main chat endpoint."""
+    """Enhanced chat endpoint with advanced RAG features."""
     if rag_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
     try:
-        logger.info(f"Processing question: {query.question[:100]}...")
+        logger.info(f"Processing question: {query.question[:100]}... (k={query.k}, threshold={query.similarity_threshold})")
         
         result = rag_service.generate_answer(
             question=query.question,
             history=query.history,
-            max_tokens=query.max_tokens
+            max_tokens=query.max_tokens,
+            k=query.k,
+            similarity_threshold=query.similarity_threshold,
+            use_context_limit=query.use_context_limit
         )
         
         return ChatResponse(**result)
@@ -299,6 +370,34 @@ async def ask_question_stream(query: Query):
         
     except Exception as e:
         logger.error(f"Error in streaming endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/search")
+async def search_documents_endpoint(
+    query: str,
+    k: int = 3,
+    with_scores: bool = True
+):
+    """Search documents directly without generating chat response."""
+    try:
+        results = search_documents(query, k=k, with_scores=with_scores)
+        return {
+            "query": query,
+            "results": results,
+            "count": len(results)
+        }
+    except Exception as e:
+        logger.error(f"Error in search endpoint: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+@app.get("/vectorstore/info")
+async def get_vectorstore_info_endpoint():
+    """Get information about the loaded vectorstore."""
+    try:
+        info = get_vectorstore_info()
+        return info
+    except Exception as e:
+        logger.error(f"Error getting vectorstore info: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/clear-cache")
