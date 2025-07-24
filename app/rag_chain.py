@@ -1,11 +1,11 @@
 import os
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import SentenceTransformersEmbeddings
+from langchain_community.embeddings.sentence_transformer import SentenceTransformerEmbeddings
 
 INDEX_DIR = os.path.join(os.path.dirname(__file__), '../faiss_index')
 
 def get_retriever():
-    embeddings = SentenceTransformersEmbeddings(
+    embeddings = SentenceTransformerEmbeddings(
         model_name="models/all-MiniLM-L6-v2",  # Local path to your downloaded model
         cache_folder=None  # Optional, set if you want caching elsewhere
     )
