@@ -49,7 +49,14 @@ def initialize_model():
 
 def estimate_tokens(text: str) -> int:
     """Rough token estimation (1 token ≈ 0.75 words)"""
-    return int(len(text.split()) * 1.3)
+    # Fix: Ensure we always return an integer
+    if not isinstance(text, str):
+        text = str(text)
+    word_count = len(text.split())
+    # Use round() to get proper integer conversion
+    token_estimate = round(word_count * 1.3)
+    # Ensure we return an int type (not numpy.int64 or similar)
+    return int(token_estimate)
 
 def trim_conversation_history(history: list, max_history_tokens: int = 1000) -> list:
     """Trim conversation history to fit within token budget."""

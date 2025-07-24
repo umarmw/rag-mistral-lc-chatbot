@@ -1,12 +1,14 @@
 import logging
+from pydoc import doc
 import time
-from typing import List, Dict, Any
+from typing import Optional, List, Dict, Any
 from functools import lru_cache
 
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, validator
+from pydantic import BaseModel, validator, Field, field_validator
+
 
 from app.rag_chain import (
     get_retriever, 
@@ -116,11 +118,21 @@ class Query(BaseModel):
 class ChatResponse(BaseModel):
     answer: str
     processing_time: float
-    context_used: bool = True
-    tokens_estimated: int = 0
-    documents_count: int = 0
-    avg_similarity: float = 0.0
-    context_quality: str = "unknown"
+    context_used: bool
+    documents_count: int
+    tokens_estimated: int
+    context_quality: Optional[str] = None
+    avg_similarity: Optional[float] = None
+    retrieved_documents: Optional[List[Dict[str, Any]]] = None
+    
+    # Add a validator to ensure tokens_estimated is always an integer
+    @field_validator('tokens_estimated', mode='before')
+    @classmethod
+    def validate_tokens_estimated(cls, v):
+        """Convert float to int for tokens_estimated field."""
+        if isinstance(v, (int, float)):
+            return int(round(v))
+        return v
 
 class ErrorResponse(BaseModel):
     error: str
@@ -380,7 +392,12 @@ async def search_documents_endpoint(
 ):
     """Search documents directly without generating chat response."""
     try:
-        results = search_documents(query, k=k, with_scores=with_scores)
+        chat_history = [
+            "User: What is a vector database?",
+            "Bot: It's a database for storing embeddings."
+        ]
+        results = search_documents(query="What is FAISS?", memory=chat_history, k=5, with_scores=True)
+        # results = search_documents(query, k=k, with_scores=with_scores)
         return {
             "query": query,
             "results": results,
