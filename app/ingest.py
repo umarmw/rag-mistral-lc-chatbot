@@ -1,8 +1,8 @@
+import os
 from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.embeddings import HuggingFaceEmbeddings
-from langchain.vectorstores import FAISS
-import os
+from langchain_community.embeddings import SentenceTransformersEmbeddings
+from langchain_community.vectorstores import FAISS
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '../data')
 INDEX_DIR = os.path.join(os.path.dirname(__file__), '../faiss_index')
@@ -21,7 +21,7 @@ def ingest():
     chunks = splitter.split_documents(all_docs)
 
     print("[INFO] Creating embeddings and storing in FAISS...")
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    embeddings = SentenceTransformersEmbeddings(model_name="models/all-MiniLM-L6-v2")
     db = FAISS.from_documents(chunks, embeddings)
     db.save_local(INDEX_DIR)
     print(f"[INFO] Vector store saved to {INDEX_DIR}")
