@@ -3,3 +3,4 @@ venv/
 faiss_index/
 models/*.gguf
 *.log
+models/embeddings/
